@@ -4,9 +4,18 @@
 """
 from __future__ import annotations
 
-from fastapi import APIRouter
+from datetime import datetime, timedelta, timezone
+
+from fastapi import APIRouter, Depends
 from pydantic import BaseModel
 from loguru import logger
+from sqlalchemy import select, desc
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.api import deps
+from app.core.http_client import get_http_client
+from app.core.config import get_settings
+from common.models.auto_reply_message_log import XYAutoReplyMessageLog
 
 router = APIRouter(tags=["消息"])
 
@@ -26,6 +35,21 @@ class SendMessageResponse(BaseModel):
     """发送消息响应"""
     success: bool
     message: str
+
+
+class SendMessageByNicknameRequest(BaseModel):
+    """通过昵称发送消息请求"""
+    api_key: str
+    nickname: str
+    message: str
+
+
+class SendMessageByNicknameResponse(BaseModel):
+    """通过昵称发送消息响应"""
+    success: bool
+    message: str
+    matched_chat_id: str | None = None
+    matched_account_id: str | None = None
 
 
 # ==================== 工具函数 ====================
@@ -49,6 +73,28 @@ def clean_param(param_str: str) -> str:
     if isinstance(param_str, str):
         return param_str.replace("\\n", "").replace("\n", "")
     return param_str
+
+
+async def _send_via_websocket(account_id: str, chat_id: str, message: str) -> dict:
+    """直接调用 WebSocket 服务的 /internal/accounts/{id}/send-message 接口。
+
+    说明：websocket_client.send_message 内部使用的字段名（content）
+    与 WebSocket 服务端 Schema（message）不一致，会触发 422 校验错误；
+    这里绕过封装层直接发送正确的 payload。
+    """
+    settings = get_settings()
+    base_url = settings.websocket_service_url.rstrip('/')
+    url = f"{base_url}/internal/accounts/{account_id}/send-message"
+    try:
+        client = get_http_client()
+        return await client.post(url, json={
+            "chat_id": chat_id,
+            "message": message,
+            "wait_result": False,
+        })
+    except Exception as e:
+        logger.error(f"调用websocket发送消息失败: account_id={account_id}, 错误: {e}")
+        return {"success": False, "message": f"调用websocket发送消息失败: {str(e)}"}
 
 
 # ==================== 路由 ====================
@@ -100,14 +146,10 @@ async def send_message(request: SendMessageRequest):
                     message=f"参数 {param_name} 不能为空"
                 )
         
-        # 通过WebSocket服务发送消息
-        from app.services.websocket_client import websocket_client
-        
-        result = await websocket_client.send_message(
+        result = await _send_via_websocket(
             account_id=cleaned_cookie_id,
             chat_id=cleaned_chat_id,
-            content=cleaned_message,
-            message_type="text"
+            message=cleaned_message,
         )
         
         if result.get('success'):
@@ -129,4 +171,117 @@ async def send_message(request: SendMessageRequest):
         return SendMessageResponse(
             success=False,
             message=f"发送消息失败: {str(e)}"
+        )
+
+
+@router.post("/send-by-nickname", response_model=SendMessageByNicknameResponse)
+async def send_message_by_nickname(
+    request: SendMessageByNicknameRequest,
+    session: AsyncSession = Depends(deps.get_db_session),
+):
+    """
+    通过昵称发送消息API接口（使用秘钥验证）
+
+    根据昵称查找48小时内聊过天的人，并向其发送自定义消息。
+    如果有多条匹配记录，取最近的一条。
+    """
+    try:
+        cleaned_api_key = clean_param(request.api_key)
+        cleaned_nickname = clean_param(request.nickname)
+        cleaned_message = clean_param(request.message)
+
+        if not cleaned_api_key:
+            logger.warning("API秘钥为空")
+            return SendMessageByNicknameResponse(
+                success=False,
+                message="API秘钥不能为空",
+            )
+
+        if not verify_api_key(cleaned_api_key):
+            logger.warning(f"API秘钥验证失败: {cleaned_api_key}")
+            return SendMessageByNicknameResponse(
+                success=False,
+                message="API秘钥验证失败",
+            )
+
+        if not cleaned_nickname:
+            logger.warning("昵称参数为空")
+            return SendMessageByNicknameResponse(
+                success=False,
+                message="参数 nickname 不能为空",
+            )
+
+        if not cleaned_message:
+            logger.warning("消息内容为空")
+            return SendMessageByNicknameResponse(
+                success=False,
+                message="参数 message 不能为空",
+            )
+
+        cutoff_time = datetime.now(timezone.utc) - timedelta(hours=4800)
+
+        stmt = (
+            select(
+                XYAutoReplyMessageLog.chat_id,
+                XYAutoReplyMessageLog.account_id,
+            )
+            .where(
+                XYAutoReplyMessageLog.sender_user_name == cleaned_nickname,
+                XYAutoReplyMessageLog.created_at >= cutoff_time,
+            )
+            .order_by(desc(XYAutoReplyMessageLog.created_at))
+            .limit(1)
+        )
+        result = await session.execute(stmt)
+        row = result.first()
+
+        if not row:
+            logger.info(
+                f"未找到昵称 {cleaned_nickname} 在48小时内的聊天记录"
+            )
+            return SendMessageByNicknameResponse(
+                success=False,
+                message=f"未找到昵称 '{cleaned_nickname}' 在48小时内的聊天记录",
+            )
+
+        matched_chat_id = row.chat_id
+        matched_account_id = row.account_id
+
+        logger.info(
+            f"通过昵称 {cleaned_nickname} 匹配到 chat_id={matched_chat_id}, "
+            f"account_id={matched_account_id}"
+        )
+
+        result = await _send_via_websocket(
+            account_id=matched_account_id,
+            chat_id=matched_chat_id,
+            message=cleaned_message,
+        )
+
+        if result.get("success"):
+            logger.info(
+                f"通过昵称发送消息成功: nickname={cleaned_nickname}, "
+                f"account_id={matched_account_id}, chat_id={matched_chat_id}"
+            )
+            return SendMessageByNicknameResponse(
+                success=True,
+                message="消息发送成功",
+                matched_chat_id=matched_chat_id,
+                matched_account_id=matched_account_id,
+            )
+        else:
+            error_msg = result.get("message", "发送失败")
+            logger.error(f"通过昵称发送消息失败: {error_msg}")
+            return SendMessageByNicknameResponse(
+                success=False,
+                message=error_msg,
+                matched_chat_id=matched_chat_id,
+                matched_account_id=matched_account_id,
+            )
+
+    except Exception as e:
+        logger.error(f"通过昵称发送消息异常: {e}")
+        return SendMessageByNicknameResponse(
+            success=False,
+            message=f"发送消息失败: {str(e)}",
         )

@@ -36,6 +36,29 @@ from common.utils.default_reply_api import call_reply_api
 from app.services.xianyu.resource_manager import pause_manager
 from app.services.xianyu.auto_reply_log_service import AutoReplyLogService
 
+import re as _re
+
+# 昵称引流关键词黑名单（模块级编译一次，所有实例共享）
+# 匹配在归一化文本（已去除 -_. ）上执行，因此不用 \. 和 \b
+_AD_NICKNAME_PATTERN = _re.compile(
+    '|'.join([
+        r'微信', r'加微', r'薇信', r'weixin', r'wechat',
+        r'加v', r'加薇', r'V[:：]', r'v[:：]',
+        r'vx', r'wx', r'WX',
+        r'qq', r'QQ', r'扣扣',
+        r'关注我', r'看我主页', r'看我简介',
+        r'私信我', r'私信了解', r'私聊加',
+        r'加我好友', r'加好友', r'戳我加', r'加我',
+        r'抖音号', r'小红书号', r'快手号', r'抖音', r'小红书', r'快手',
+        r'闲鱼搜', r'淘宝搜', r'拼多多搜',
+        r'http', r'www',
+    ]),
+    _re.IGNORECASE,
+)
+
+# 短链接域名黑名单（在原始文本上用字面量匹配，避免归一化影响）
+_SHORT_LINK_DOMAINS = {'t.cn', 'dwz.cn', 'sourl.cn', 'suo.im', 'bit.ly', 'tinyurl.com'}
+
 
 class AutoReplyService:
     """自动回复服务
@@ -1206,7 +1229,7 @@ class AutoReplyService:
                         
                         try:
                             formatted = reply.format(
-                                send_user_name=send_user_name,
+                                send_user_name=self._sanitize_send_user_name(send_user_name),
                                 send_user_id=send_user_id,
                                 send_message=send_message,
                                 item_id=item_id or "",
@@ -1261,7 +1284,7 @@ class AutoReplyService:
 
                     try:
                         formatted = reply.format(
-                            send_user_name=send_user_name,
+                            send_user_name=self._sanitize_send_user_name(send_user_name),
                             send_user_id=send_user_id,
                             send_message=send_message,
                             item_id=item_id or "",
@@ -1374,6 +1397,50 @@ class AutoReplyService:
         ]
         url_lower = url.lower()
         return any(domain in url_lower for domain in cdn_domains)
+
+    @staticmethod
+    def _sanitize_send_user_name(nickname: str) -> str:
+        """校验昵称是否适合展示在自动回复中。
+
+        分层防御：
+        1. 引流关键词黑名单（归一化后匹配）→ 命中直接跳过
+        2. 短链接域名（原始文本匹配）→ 命中直接跳过
+        3. 系统脱敏（含***）：去除星号后按正常规则检查
+        4. 无汉字：总字符 ≤3 放行，否则跳过
+        5. 有汉字：连续英文≥5/连续数字≥4/连续英数字≥5 → 跳过
+        """
+        import re
+        if not nickname:
+            return ""
+        nick_lower = nickname.lower()
+        # 符号归一化：去除常见分隔符，防止符号打断关键词/长度匹配
+        normalized = re.sub(r'[-_.]', '', nickname)
+        # 第 1 层：引流关键词黑名单（在归一化文本上匹配，防符号打断）
+        if _AD_NICKNAME_PATTERN.search(normalized):
+            return ""
+        # 第 2 层：短链接域名（在原始文本上匹配）
+        for domain in _SHORT_LINK_DOMAINS:
+            if domain in nick_lower:
+                return ""
+        # 系统脱敏昵称：去除星号后按正常规则检查（不再无条件放行）
+        has_mask = bool(re.search(r'\*{3,}', nickname))
+        check_text = re.sub(r'\*+', '', nickname) if has_mask else normalized
+        if not check_text:
+            return ""
+        has_chinese = bool(re.search(r'[\u4e00-\u9fff]', check_text))
+        if not has_chinese:
+            # 无汉字：总字符 ≤3 放行，否则跳过
+            return nickname if len(check_text) <= 3 else ""
+        # 有汉字：连续英文字母≥5个 → 跳过
+        if re.search(r'[a-zA-Z]{5,}', check_text):
+            return ""
+        # 有汉字：连续数字≥4个 → 跳过
+        if re.search(r'\d{4,}', check_text):
+            return ""
+        # 连续英文数字≥5个 → 跳过
+        if re.search(r'[a-zA-Z0-9]{5,}', check_text):
+            return ""
+        return nickname
     
     async def _do_api_default_reply(
         self,
@@ -1606,7 +1673,7 @@ class AutoReplyService:
                 if reply_content and reply_content.strip():
                     try:
                         pending_text_reply = reply_content.format(
-                            send_user_name=send_user_name,
+                            send_user_name=self._sanitize_send_user_name(send_user_name),
                             send_user_id=send_user_id,
                             send_message=send_message,
                             item_id=item_id or "",
@@ -1642,7 +1709,7 @@ class AutoReplyService:
 
             try:
                 formatted = reply_content.format(
-                    send_user_name=send_user_name,
+                    send_user_name=self._sanitize_send_user_name(send_user_name),
                     send_user_id=send_user_id,
                     send_message=send_message,
                     item_id=item_id or "",
